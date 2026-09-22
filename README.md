@@ -11,17 +11,22 @@
 回溯最优路径后输出：参考拍 ↔ 演奏音的**一一对应映射**、漏拍 / 插入拍清单、
 按连续段组织的**偏差区间**及统计指标。结果持久化到 SQLite，可反复查询。
 
+创建任务时还可以提供**锚点（anchors）硬约束**：显式声明某些“参考拍 ↔ 演奏音”
+必须配对（例如人工确认的重音点、已知小节线位置）。对齐时 DTW 被拆成相邻锚点
+之间的若干独立子段分别寻优，再合并为完整路径——锚点保证被采用，段内仍允许
+漏拍、插入拍与连续偏差。
+
 ## 目录结构
 
 ```
 .
 ├── app/
 │   ├── main.py          # FastAPI 路由
-│   ├── alignment.py     # 带宽约束 DTW 核心算法（纯标准库）
+│   ├── alignment.py     # 带宽约束 DTW 核心算法（纯标准库，含锚点分段对齐）
 │   ├── schemas.py       # Pydantic 请求/响应模型
-│   ├── database.py      # SQLite 连接与建表
+│   ├── database.py      # SQLite 连接、建表与旧库迁移
 │   └── crud.py          # 任务读写
-├── tests/               # unittest 测试（算法 9 个 + 接口 6 个）
+├── tests/               # unittest 测试（算法 18 个 + 接口 14 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -65,10 +70,10 @@ PYTHONPATH=. python -m unittest discover -s tests -v
 
 | 方法   | 路径                       | 说明                                   |
 | ------ | -------------------------- | -------------------------------------- |
-| POST   | `/jobs`                    | 创建对齐任务（状态 `pending`）         |
-| POST   | `/jobs/{id}/align`         | 执行 DTW 对齐并保存结果                |
-| GET    | `/jobs/{id}`               | 查询任务（含完整输入与结果）           |
-| GET    | `/jobs/{id}/result`        | 只查询对齐结果                         |
+| POST   | `/jobs`                    | 创建对齐任务（可选 `anchors` 锚点，状态 `pending`） |
+| POST   | `/jobs/{id}/align`         | 执行（锚点约束）DTW 对齐并保存结果     |
+| GET    | `/jobs/{id}`               | 查询任务（含完整输入、锚点与结果）     |
+| GET    | `/jobs/{id}/result`        | 只查询对齐结果（含已采用锚点）         |
 | GET    | `/jobs`                    | 任务列表（摘要，按创建时间倒序）       |
 | GET    | `/health`                  | 健康检查                               |
 
@@ -82,6 +87,10 @@ PYTHONPATH=. python -m unittest discover -s tests -v
   "name": "take-01",
   "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
   "performance_onsets": [-0.02, 0.47, 1.53, 1.76, 2.04, 2.52],
+  "anchors": [
+    {"ref_index": 0, "perf_index": 0},
+    {"ref_index": 5, "perf_index": 5}
+  ],
   "params": {
     "band_width": 2,
     "skip_penalty": null,
@@ -93,6 +102,18 @@ PYTHONPATH=. python -m unittest discover -s tests -v
 
 - `reference_beats` / `performance_onsets`：单位秒，必须**严格递增**
   （允许略小于 0 的前摇时间，例如演奏音比第 0 拍早几十毫秒）。
+- `anchors`（可选）：锚点硬约束数组，每项 `{"ref_index", "perf_index"}`
+  为 **0 基**索引，表示“该参考拍必须与该演奏音匹配”。
+  - 两个索引都必须**严格递增**（锚点按出现顺序排列，不可重复使用某一拍）；
+  - 必须在各自序列范围内（`ref_index < len(reference_beats)`、
+    `perf_index < len(performance_onsets)`）且非负；
+  - 每个锚点必须在带宽内可达：`|ref_index − perf_index| ≤ band_width`；
+  - 相邻锚点之间、首锚点到起点、末锚点到终点的漏拍 / 插入拍数量也受带宽约束，
+    服务会对以上所有情况校验，不满足时返回 `400` 并给出具体原因
+    （越界 / 非递增 / 超出带宽不可达）。
+  - 对齐时每个相邻锚点对之间独立做一段 DTW，再按顺序合并为完整路径；
+    **漏拍 / 插入拍仍可发生在锚点之间的段内**。对齐结果的 `anchors` 字段
+    回传本次实际采用的锚点（含两侧时间、偏差与 early/on_time/late 状态）。
 - `params.band_width`：Sakoe-Chiba 带宽（拍数，默认 3）。要求
   `|len(ref) − len(perf)| ≤ band_width`，否则创建时返回 `400`。
   带宽越小越保守（只允许局部错位），越大越能容忍连续漏拍 / 插入拍。
@@ -106,16 +127,18 @@ PYTHONPATH=. python -m unittest discover -s tests -v
 ## 示例请求（curl 完整流程）
 
 ```bash
-# 1) 创建任务
+# 1) 创建任务（带两个锚点：开头与结尾必须一一对应）
 curl -s -X POST http://localhost:8000/jobs \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "take-01",
     "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
     "performance_onsets": [-0.02, 0.47, 1.53, 1.76, 2.04, 2.52],
+    "anchors": [{"ref_index": 0, "perf_index": 0},
+                {"ref_index": 5, "perf_index": 5}],
     "params": {"band_width": 2}
   }'
-# => 201，记录返回的 "id"（下文以 $ID 表示）
+# => 201，记录返回的 "id"（下文以 $ID 表示）；非法锚点会返回 400
 
 # 2) 执行对齐
 curl -s -X POST http://localhost:8000/jobs/$ID/align
@@ -139,10 +162,14 @@ job = requests.post(f"{BASE}/jobs", json={
     "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
     "performance_onsets": [-0.02, 0.47, 1.53, 1.76, 2.04, 2.52],
     "params": {"band_width": 2},
+    # 可选：锚点硬约束（参考拍索引、演奏音索引，均 0 基且严格递增）
+    "anchors": [{"ref_index": 0, "perf_index": 0},
+                {"ref_index": 5, "perf_index": 5}],
 }).json()
 
 result = requests.post(f"{BASE}/jobs/{job['id']}/align").json()["result"]
 
+print("已采用锚点:", [(a["ref_index"], a["perf_index"]) for a in result["anchors"]])
 for b in result["matched_beats"]:
     print(b["ref_index"], "->", b["perf_index"],
           f"偏差 {b['deviation']:+.2f}s ({b['status']})")
@@ -156,6 +183,13 @@ print("插入拍:", [b["perf_index"] for b in result["inserted_beats"]])
 
 ```json
 {
+  "parameters": { /* 实际使用的带宽与惩罚代价 */ },
+  "anchors": [
+    {"ref_index": 0, "perf_index": 0, "ref_time": 0.0, "perf_time": -0.02,
+     "deviation": -0.02, "status": "on_time"},
+    {"ref_index": 5, "perf_index": 5, "ref_time": 2.5, "perf_time": 2.52,
+     "deviation": 0.02, "status": "on_time"}
+  ],
   "matched_beats": [
     {"ref_index": 0, "perf_index": 0, "ref_time": 0.0,  "perf_time": -0.02, "deviation": -0.02, "status": "on_time"},
     {"ref_index": 1, "perf_index": 1, "ref_time": 0.5,  "perf_time": 0.47,  "deviation": -0.03, "status": "early"},
@@ -178,6 +212,9 @@ print("插入拍:", [b["perf_index"] for b in result["inserted_beats"]])
 }
 ```
 
+- `anchors`：本次对齐实际采用的锚点（即创建任务时提交、并作为硬约束
+  生效的那些点），未提供锚点时为 `[]`。任务对象上另有同名 `anchors`
+  字段，保存创建时提交的锚点，便于复查输入。
 - `matched_beats`：一一对应映射，含两侧索引、时间、偏差（秒）与状态。
 - `missed_beats` / `inserted_beats`：未配对的参考拍 / 演奏音。
 - `deviation_segments`：按**参考拍索引连续**切出的最大匹配段（漏拍 /
@@ -209,10 +246,27 @@ D(i,j) = min of  ⎨ D(i−1,j)   + skip_penalty          漏拍（水平）
   取对角匹配，保证结果确定。
 - 2000 拍、带宽 13 的典型输入在普通笔记本上约 0.3s、50MB 内存。
 
+### 锚点硬约束下的分段 DTW
+
+提供 `anchors = [(r₁,p₁), …, (rₖ,pₖ)]` 时：
+
+1. 先校验锚点非负、不越界、两侧索引严格递增，且每个锚点满足
+   `|r−p| ≤ band_width`（在带内即保证与相邻锚点 / 端点之间存在合法路径）；
+2. 匹配 `ref[r] ↔ perf[p]` 的对角步落在 DP 网格单元 `(r+1, p+1)`，把这些
+   单元连同虚拟端点 `(0,0)`、`(n,m)` 作为分段边界；
+3. 每两个相邻边界之间独立运行上述带状 DTW；真实锚点单元**禁止水平 / 垂直
+   进入**（只能对角进入），因此锚点一定是一次匹配，构成硬约束；
+4. 各子段回溯出的单元路径按序拼接（段端点不重复），再统一还原
+   匹配 / 漏拍 / 插入拍事件——漏拍与插入拍可以出现在任意段内，
+   总代价为各段代价之和；
+5. 结果 `anchors` 字段从最终路径中提取，回传已采用锚点及其偏差与状态。
+
 ## 状态码
 
 - `201` 任务创建成功；`200` 对齐 / 查询成功
-- `400` 带宽不足无法对齐（含 `|n−m| > band_width` 预检）或惩罚参数非法
+- `400` 带宽不足无法对齐（含 `|n−m| > band_width` 预检）、惩罚参数非法，
+  或锚点校验失败（索引为负 / 越界 / 非严格递增 / 超出带宽不可达），
+  `detail` 中会给出具体锚点与原因
 - `404` 任务不存在
 - `409` 对尚未对齐（`pending`）的任务调用 `/result`
-- `422` 请求体校验失败（空序列、非递增等）
+- `422` 请求体校验失败（空序列、非递增、字段类型错误等）

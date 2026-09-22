@@ -18,6 +18,8 @@ def _row_to_job(row: sqlite3.Row) -> dict[str, Any]:
         "name": row["name"],
         "reference_beats": json.loads(row["reference_beats"]),
         "performance_onsets": json.loads(row["performance_onsets"]),
+        # 兼容迁移前的旧数据库（旧行没有 anchors 列值）
+        "anchors": json.loads(row["anchors"]) if row["anchors"] else [],
         "params": json.loads(row["params"]),
         "status": row["status"],
         "error": row["error"],
@@ -33,17 +35,19 @@ def create_job(
     reference_beats: list[float],
     performance_onsets: list[float],
     params: dict[str, Any],
+    anchors: list[Any] | None = None,
 ) -> dict[str, Any]:
     cur = conn.execute(
         """
-        INSERT INTO jobs (name, reference_beats, performance_onsets, params,
-                          status, error, result, created_at, aligned_at)
-        VALUES (?, ?, ?, ?, 'pending', NULL, NULL, ?, NULL)
+        INSERT INTO jobs (name, reference_beats, performance_onsets, anchors,
+                          params, status, error, result, created_at, aligned_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', NULL, NULL, ?, NULL)
         """,
         (
             name,
             json.dumps(reference_beats),
             json.dumps(performance_onsets),
+            json.dumps(anchors or []),
             json.dumps(params),
             _now(),
         ),

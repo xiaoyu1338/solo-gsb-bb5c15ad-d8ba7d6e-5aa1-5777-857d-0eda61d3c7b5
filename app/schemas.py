@@ -28,6 +28,13 @@ class AlignmentParamsPayload(BaseModel):
     )
 
 
+class AnchorPair(BaseModel):
+    ref_index: int = Field(
+        ..., description="参考拍索引（0 基），锚点表示该参考拍必须与该演奏音匹配"
+    )
+    perf_index: int = Field(..., description="演奏音索引（0 基）")
+
+
 class JobCreate(BaseModel):
     name: str | None = Field(default=None, max_length=200, description="任务名称")
     reference_beats: list[float] = Field(
@@ -35,6 +42,13 @@ class JobCreate(BaseModel):
     )
     performance_onsets: list[float] = Field(
         ..., min_length=1, description="演奏音符起始时间（秒），需严格递增"
+    )
+    anchors: list[AnchorPair] | None = Field(
+        default=None,
+        description=(
+            "锚点硬约束（按索引一一对应）：对齐路径必须经过这些 参考拍↔演奏音 匹配点；"
+            "参考拍索引与演奏音索引均需严格递增、不越界且在带宽内可达"
+        ),
     )
     params: AlignmentParamsPayload = Field(default_factory=AlignmentParamsPayload)
 
@@ -92,8 +106,21 @@ class SignedInterval(BaseModel):
     mean_deviation: float
 
 
+class AdoptedAnchor(BaseModel):
+    ref_index: int
+    perf_index: int
+    ref_time: float
+    perf_time: float
+    deviation: float
+    status: BeatStatus
+
+
 class AlignmentResult(BaseModel):
     parameters: dict[str, Any]
+    anchors: list[AdoptedAnchor] = Field(
+        default_factory=list,
+        description="本次对齐实际采用的锚点（与请求中给出的硬约束一致）",
+    )
     matched_beats: list[BeatPair]
     missed_beats: list[MissedBeat]
     inserted_beats: list[InsertedBeat]
@@ -117,6 +144,9 @@ class JobOut(BaseModel):
     name: str | None
     reference_beats: list[float]
     performance_onsets: list[float]
+    anchors: list[AnchorPair] = Field(
+        default_factory=list, description="任务创建时指定的锚点硬约束"
+    )
     params: dict[str, Any]
     status: str
     error: str | None
