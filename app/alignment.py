@@ -7,6 +7,10 @@
 * skip     —— 漏拍（演奏缺失参考拍 i），代价为惩罚项；
 * insert   —— 插入拍（多出来的演奏音 j），代价为惩罚项。
 
+可选提供若干**锚点**（参考拍索引、演奏音索引）。锚点作为硬约束：
+每个锚点必须以对角匹配步经过，整体 DP 被拆成“起点→锚点 1→…→
+锚点 k→终点”若干段分别在全局带宽内求解，再按序拼接为完整路径。
+
 回溯后输出一一对应映射、漏拍 / 插入拍列表、连续偏差区间及统计指标。
 """
 
@@ -84,12 +88,163 @@ def _classify(dev: float, threshold: float) -> str:
     return "on_time"  # 准时
 
 
+def validate_anchors(
+    anchors: Sequence[tuple[int, int]] | None,
+    n: int,
+    m: int,
+    width: int,
+) -> list[tuple[int, int]]:
+    """校验锚点约束，返回规范化后的锚点列表。
+
+    依次检查：非空、索引越界、两侧索引严格递增、锚点处带宽不可达。
+    任一不满足抛出 AlignmentError（接口层转换为 400）。
+    """
+    if not anchors:
+        return []
+    norm: list[tuple[int, int]] = []
+    for k, item in enumerate(anchors):
+        try:
+            ri, pj = int(item[0]), int(item[1])
+        except (TypeError, IndexError, ValueError):
+            raise AlignmentError(
+                f"第 {k + 1} 个锚点格式非法：需为 [参考拍索引, 演奏音索引]"
+            )
+        if not (0 <= ri < n) or not (0 <= pj < m):
+            raise AlignmentError(
+                f"第 {k + 1} 个锚点 ({ri}, {pj}) 越界：参考拍索引须在 "
+                f"[0, {n - 1}]、演奏音索引须在 [0, {m - 1}] 内"
+            )
+        if norm:
+            prev_ri, prev_pj = norm[-1]
+            if ri <= prev_ri:
+                raise AlignmentError(
+                    f"锚点参考拍索引必须严格递增：第 {k} 个为 {prev_ri}，"
+                    f"第 {k + 1} 个为 {ri}"
+                )
+            if pj <= prev_pj:
+                raise AlignmentError(
+                    f"锚点演奏音索引必须严格递增：第 {k} 个为 {prev_pj}，"
+                    f"第 {k + 1} 个为 {pj}"
+                )
+        if abs(ri - pj) > width:
+            raise AlignmentError(
+                f"第 {k + 1} 个锚点 ({ri}, {pj}) 带宽不可达："
+                f"|参考索引−演奏索引|={abs(ri - pj)} 超过带宽 {width}"
+            )
+        norm.append((ri, pj))
+    return norm
+
+
+def _dtw_segment(
+    ref: Sequence[float],
+    perf: Sequence[float],
+    i0: int,
+    j0: int,
+    i1: int,
+    j1: int,
+    width: int,
+    skip_cost: float,
+    insert_cost: float,
+    label: str,
+    force_diagonal_end: bool,
+) -> tuple[list[tuple[int, int]], list[int], list[int], float]:
+    """对相邻锚点（含虚拟起点/终点）之间的一段做带宽约束 DTW。
+
+    段在全局网格中的起点格为 (i0, j0)（代价 0，不产生步），终点格为
+    (i1, j1)；带约束沿用全局坐标 |i−j| ≤ width，保证各段拼接后仍是
+    一条位于原 Sakoe-Chiba 带内的完整路径。``force_diagonal_end`` 为
+    True 时终点格只允许以对角匹配步到达（锚点必须被真正匹配）。
+
+    返回该段的三类步（全局索引的漏拍、插入拍、匹配对，均按路径顺序）
+    与段代价。
+    """
+    ni = i1 - i0
+    nj = j1 - j0
+
+    dp = array("d", [math.inf]) * ((ni + 1) * (nj + 1))
+    ptr = array("b", bytes((ni + 1) * (nj + 1)))
+
+    def idx(a: int, b: int) -> int:
+        return a * (nj + 1) + b
+
+    dp[0] = 0.0
+
+    for a in range(ni + 1):
+        # 直接用全局坐标计算带边界，保证拼出的完整路径位于原 Sakoe-Chiba 带内
+        b_lo = max(0, (i0 + a) - width - j0)
+        b_hi = min(nj, (i0 + a) + width - j0)
+        for b in range(b_lo, b_hi + 1):
+            if a == 0 and b == 0:
+                continue
+            cur = idx(a, b)
+            best = math.inf
+            best_ptr = 0
+            is_end = a == ni and b == nj
+
+            # 对角：ref[i0+a-1] <-> perf[j0+b-1]（匹配）
+            if a > 0 and b > 0:
+                d = perf[j0 + b - 1] - ref[i0 + a - 1]
+                cand = dp[idx(a - 1, b - 1)] + d * d
+                if cand < best:
+                    best, best_ptr = cand, _PTR_MATCH
+            # 水平：跳过参考拍（漏拍）。终点为锚点时禁止以漏/插步到达。
+            if a > 0 and not (is_end and force_diagonal_end):
+                cand = dp[idx(a - 1, b)] + skip_cost
+                if cand < best:
+                    best, best_ptr = cand, _PTR_SKIP
+            # 垂直：插入演奏拍（插入拍）
+            if b > 0 and not (is_end and force_diagonal_end):
+                cand = dp[idx(a, b - 1)] + insert_cost
+                if cand < best:
+                    best, best_ptr = cand, _PTR_INSERT
+
+            if best_ptr:
+                dp[cur] = best
+                ptr[cur] = best_ptr
+
+    seg_cost = dp[idx(ni, nj)]
+    if not math.isfinite(seg_cost):
+        raise AlignmentError(
+            f"{label}之间在带宽 {width} 内不存在可行对齐路径，"
+            "请增大 band_width 或调整锚点"
+        )
+
+    seg_pairs: list[tuple[int, int]] = []
+    skip_steps: list[int] = []
+    insert_steps: list[int] = []
+    a, b = ni, nj
+    while a > 0 or b > 0:
+        p = ptr[idx(a, b)]
+        if p == _PTR_MATCH:
+            seg_pairs.append((i0 + a - 1, j0 + b - 1))
+            a -= 1
+            b -= 1
+        elif p == _PTR_SKIP:
+            skip_steps.append(i0 + a - 1)
+            a -= 1
+        elif p == _PTR_INSERT:
+            insert_steps.append(j0 + b - 1)
+            b -= 1
+        else:  # pragma: no cover - 理论不可达
+            raise AlignmentError(f"{label}段回溯失败：遇到不可达状态")
+
+    seg_pairs.reverse()
+    skip_steps.reverse()
+    insert_steps.reverse()
+    return seg_pairs, skip_steps, insert_steps, seg_cost
+
+
 def align_beats(
     ref: Sequence[float],
     perf: Sequence[float],
     params: AlignmentParams | None = None,
+    anchors: Sequence[tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
-    """执行带宽约束 DTW 对齐，返回完整结果字典。"""
+    """执行带宽约束 DTW 对齐，返回完整结果字典。
+
+    ``anchors`` 为可选的 (参考拍索引, 演奏音索引) 硬约束：每个锚点必须
+    被一一匹配，DTW 仅在相邻锚点之间分段求解后拼接。
+    """
     params = params or AlignmentParams()
     n = len(ref)
     m = len(perf)
@@ -113,76 +268,43 @@ def align_beats(
         raise AlignmentError("惩罚代价不能为负")
 
     width = params.band_width
-    size = (n + 1) * (m + 1)
+    anchors_norm = validate_anchors(anchors, n, m, width)
 
-    # 一维展平的代价矩阵与回溯指针；用紧凑数组降低内存占用。
-    dp = array("d", [math.inf]) * size
-    ptr = array("b", bytes(size))
-    dp[0] = 0.0
+    # 段边界格点：虚拟起点 (0,0)、各锚点对应格点 (ri+1, pj+1)、虚拟终点 (n,m)。
+    # 每个边界附带“自起点起的序号”：0=起点，1..k=各锚点，k+1=终点。
+    boundaries: list[tuple[int, int, int]] = [(0, 0, 0)]
+    for k, (ri, pj) in enumerate(anchors_norm, start=1):
+        boundaries.append((ri + 1, pj + 1, k))
+    boundaries.append((n, m, len(anchors_norm) + 1))
 
-    def idx(i: int, j: int) -> int:
-        return i * (m + 1) + j
+    def _node_name(ord_: int) -> str:
+        if ord_ == 0:
+            return "起点"
+        if ord_ <= len(anchors_norm):
+            return f"锚点 {ord_}"
+        return "终点"
 
-    def in_band(a: int, b: int) -> bool:
-        return -width <= a - b <= width
-
-    # 正向 DP：固定端点 (0,0)->(n,m)，只在带宽内展开。
-    for i in range(0, n + 1):
-        j_lo = max(0, i - width)
-        j_hi = min(m, i + width)
-        for j in range(j_lo, j_hi + 1):
-            if i == 0 and j == 0:
-                continue
-            cur = idx(i, j)
-            best = math.inf
-            best_ptr = 0
-
-            # 对角：ref[i-1] <-> perf[j-1]（匹配）
-            if i > 0 and j > 0 and in_band(i - 1, j - 1):
-                d = perf[j - 1] - ref[i - 1]
-                cand = dp[idx(i - 1, j - 1)] + d * d
-                if cand < best:
-                    best, best_ptr = cand, _PTR_MATCH
-            # 水平：跳过参考拍 i-1（漏拍）
-            if i > 0 and in_band(i - 1, j):
-                cand = dp[idx(i - 1, j)] + skip_cost
-                if cand < best:
-                    best, best_ptr = cand, _PTR_SKIP
-            # 垂直：插入演奏拍 j-1（插入拍）
-            if j > 0 and in_band(i, j - 1):
-                cand = dp[idx(i, j - 1)] + insert_cost
-                if cand < best:
-                    best, best_ptr = cand, _PTR_INSERT
-
-            if best_ptr:
-                dp[cur] = best
-                ptr[cur] = best_ptr
-
-    total_cost = dp[idx(n, m)]
-    if not math.isfinite(total_cost):
-        raise AlignmentError("在给定带宽内不存在可行对齐路径，请增大 band_width")
-
-    # 回溯
-    pairs: list[tuple[int, int]] = []
+    pair_steps: list[tuple[int, int]] = []
     missed: list[int] = []
     extra: list[int] = []
-    i, j = n, m
-    while i > 0 or j > 0:
-        p = ptr[idx(i, j)]
-        if p == _PTR_MATCH:
-            pairs.append((i - 1, j - 1))
-            i -= 1
-            j -= 1
-        elif p == _PTR_SKIP:
-            missed.append(i - 1)
-            i -= 1
-        elif p == _PTR_INSERT:
-            extra.append(j - 1)
-            j -= 1
-        else:  # pragma: no cover - 理论不可达
-            raise AlignmentError("回溯失败：遇到不可达状态")
+    total_cost = 0.0
 
-    pairs.reverse()
+    for k in range(1, len(boundaries)):
+        i0, j0, ord0 = boundaries[k - 1]
+        i1, j1, ord1 = boundaries[k]
+        # 终点格对应锚点时只允许以对角匹配步到达；终点 (n,m) 无需强制
+        force_diag = ord1 <= len(anchors_norm)
+        seg_pairs, seg_skips, seg_inserts, seg_cost = _dtw_segment(
+            ref, perf, i0, j0, i1, j1, width,
+            skip_cost, insert_cost,
+            f"{_node_name(ord0)}与{_node_name(ord1)}",
+            force_diagonal_end=force_diag,
+        )
+        pair_steps.extend(seg_pairs)
+        missed.extend(seg_skips)
+        extra.extend(seg_inserts)
+        total_cost += seg_cost
+
     missed.sort()
     extra.sort()
 
@@ -195,7 +317,7 @@ def align_beats(
             "deviation": round(perf[pj] - ref[ri], 6),
             "status": _classify(perf[pj] - ref[ri], params.on_time_threshold),
         }
-        for ri, pj in pairs
+        for ri, pj in pair_steps
     ]
 
     missed_beats = [
@@ -218,6 +340,16 @@ def align_beats(
             "insert_penalty": insert_cost,
             "on_time_threshold": params.on_time_threshold,
         },
+        "anchors": [
+            {
+                "ref_index": ri,
+                "perf_index": pj,
+                "ref_time": round(ref[ri], 6),
+                "perf_time": round(perf[pj], 6),
+                "deviation": round(perf[pj] - ref[ri], 6),
+            }
+            for ri, pj in anchors_norm
+        ],
         "matched_beats": matched,
         "missed_beats": missed_beats,
         "inserted_beats": inserted_beats,

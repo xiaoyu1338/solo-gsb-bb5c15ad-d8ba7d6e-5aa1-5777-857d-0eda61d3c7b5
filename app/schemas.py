@@ -28,6 +28,21 @@ class AlignmentParamsPayload(BaseModel):
     )
 
 
+class AnchorPair(BaseModel):
+    ref_index: int = Field(
+        ..., ge=0, description="锚点：参考拍索引（0 起，与 perf_index 按位置对应）"
+    )
+    perf_index: int = Field(..., ge=0, description="锚点：演奏音索引（0 起）")
+
+
+class AdoptedAnchor(BaseModel):
+    ref_index: int
+    perf_index: int
+    ref_time: float
+    perf_time: float
+    deviation: float
+
+
 class JobCreate(BaseModel):
     name: str | None = Field(default=None, max_length=200, description="任务名称")
     reference_beats: list[float] = Field(
@@ -37,6 +52,13 @@ class JobCreate(BaseModel):
         ..., min_length=1, description="演奏音符起始时间（秒），需严格递增"
     )
     params: AlignmentParamsPayload = Field(default_factory=AlignmentParamsPayload)
+    anchors: list[AnchorPair] = Field(
+        default_factory=list,
+        description=(
+            "锚点硬约束（可选）：成对的参考拍索引 / 演奏音索引，两侧均须严格递增、"
+            "不越界且在带宽内可达；对齐时 DTW 仅在相邻锚点之间分段求解"
+        ),
+    )
 
     @field_validator("reference_beats", "performance_onsets")
     @classmethod
@@ -94,6 +116,7 @@ class SignedInterval(BaseModel):
 
 class AlignmentResult(BaseModel):
     parameters: dict[str, Any]
+    anchors: list[AdoptedAnchor] = Field(default_factory=list)
     matched_beats: list[BeatPair]
     missed_beats: list[MissedBeat]
     inserted_beats: list[InsertedBeat]
@@ -118,6 +141,7 @@ class JobOut(BaseModel):
     reference_beats: list[float]
     performance_onsets: list[float]
     params: dict[str, Any]
+    anchors: list[AnchorPair] = Field(default_factory=list)
     status: str
     error: str | None
     created_at: str

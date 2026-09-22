@@ -11,6 +11,10 @@
 回溯最优路径后输出：参考拍 ↔ 演奏音的**一一对应映射**、漏拍 / 插入拍清单、
 按连续段组织的**偏差区间**及统计指标。结果持久化到 SQLite，可反复查询。
 
+创建任务时还可提供若干**锚点（anchors）硬约束**——明确知道某参考拍对应某
+演奏音时，对齐必须经过这些对应点：DTW 被分段限制在相邻锚点之间独立求解，
+再合并为完整路径，锚点处一定是一一匹配（不会被判成漏拍 / 插入拍）。
+
 ## 目录结构
 
 ```
@@ -21,7 +25,7 @@
 │   ├── schemas.py       # Pydantic 请求/响应模型
 │   ├── database.py      # SQLite 连接与建表
 │   └── crud.py          # 任务读写
-├── tests/               # unittest 测试（算法 9 个 + 接口 6 个）
+├── tests/               # unittest 测试（算法 20 个 + 接口 14 个）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -87,7 +91,11 @@ PYTHONPATH=. python -m unittest discover -s tests -v
     "skip_penalty": null,
     "insert_penalty": null,
     "on_time_threshold": 0.03
-  }
+  },
+  "anchors": [
+    {"ref_index": 0, "perf_index": 0},
+    {"ref_index": 5, "perf_index": 5}
+  ]
 }
 ```
 
@@ -99,21 +107,50 @@ PYTHONPATH=. python -m unittest discover -s tests -v
 - `params.skip_penalty` / `insert_penalty`：漏 / 插一拍的代价（**秒²**）。
   默认 `(0.5 × 参考网格中位拍间隔)²`（本例拍间隔 0.5s ⇒ 0.0625）。
 - `params.on_time_threshold`：`|偏差| ≤` 该秒数判定为 `on_time`（默认 0.03s）。
+- `anchors`（可选，默认 `[]`）：锚点硬约束数组，每项为
+  `{"ref_index": 参考拍索引, "perf_index": 演奏音索引}`（均 0 起）。校验规则：
+  - 两侧索引都必须**严格递增**（不允许两个锚点共用同一参考拍 / 同一演奏音）；
+  - 不得越界：`0 ≤ ref_index < len(reference_beats)`、
+    `0 ≤ perf_index < len(performance_onsets)`；
+  - 每个锚点必须在带宽内可达：`|ref_index − perf_index| ≤ band_width`。
+
+  以上任一不满足，创建任务返回 `400`（错误信息指明第几个锚点及原因）；
+  索引为负数等类型级错误返回 `422`。执行对齐时会再次校验并返回清晰的
+  `400`，同时把任务置为 `error`。
 
 偏差符号约定：`deviation = perf_time − ref_time`，负值=**抢拍 early**，
 正值=**拖拍 late**。
 
+### 锚点如何约束对齐
+
+锚点把对齐路径（DTW 网格上 `(0,0) → (n,m)` 的单调路径）强制分割为
+
+```
+起点 → 锚点 1 → 锚点 2 → … → 锚点 k → 终点
+```
+
+若干段，各段**仍在同一条 Sakoe-Chiba 带（全局坐标 |i−j| ≤ band_width）内
+独立做带宽约束 DTW**，然后按序拼接为完整路径；锚点所在格点只允许以对角
+（匹配）步到达，因此每个锚点保证是一次真实的一一匹配。漏拍 / 插入拍只能
+发生在相邻锚点之间的段内。结果 `result.anchors` 回显本次实际采用的锚点
+（含两侧时间与偏差），任务对象上也有提交时的 `anchors` 字段。
+
+典型用途：人工标注或由另一条已对齐轨道确定了少量确定性对应（例如开头、
+结尾、明显的结构点），希望避免 DTW 在这些位置发生“漂移式错配”。
+
 ## 示例请求（curl 完整流程）
 
 ```bash
-# 1) 创建任务
+# 1) 创建任务（anchors 可省略）
 curl -s -X POST http://localhost:8000/jobs \
   -H 'Content-Type: application/json' \
   -d '{
     "name": "take-01",
     "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
     "performance_onsets": [-0.02, 0.47, 1.53, 1.76, 2.04, 2.52],
-    "params": {"band_width": 2}
+    "params": {"band_width": 2},
+    "anchors": [{"ref_index": 0, "perf_index": 0},
+                {"ref_index": 5, "perf_index": 5}]
   }'
 # => 201，记录返回的 "id"（下文以 $ID 表示）
 
@@ -139,6 +176,7 @@ job = requests.post(f"{BASE}/jobs", json={
     "reference_beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
     "performance_onsets": [-0.02, 0.47, 1.53, 1.76, 2.04, 2.52],
     "params": {"band_width": 2},
+    "anchors": [{"ref_index": 0, "perf_index": 0}],  # 可选硬约束
 }).json()
 
 result = requests.post(f"{BASE}/jobs/{job['id']}/align").json()["result"]
@@ -156,6 +194,10 @@ print("插入拍:", [b["perf_index"] for b in result["inserted_beats"]])
 
 ```json
 {
+  "anchors": [
+    {"ref_index": 0, "perf_index": 0, "ref_time": 0.0, "perf_time": -0.02, "deviation": -0.02},
+    {"ref_index": 5, "perf_index": 5, "ref_time": 2.5, "perf_time": 2.52, "deviation": 0.02}
+  ],
   "matched_beats": [
     {"ref_index": 0, "perf_index": 0, "ref_time": 0.0,  "perf_time": -0.02, "deviation": -0.02, "status": "on_time"},
     {"ref_index": 1, "perf_index": 1, "ref_time": 0.5,  "perf_time": 0.47,  "deviation": -0.03, "status": "early"},
@@ -178,6 +220,8 @@ print("插入拍:", [b["perf_index"] for b in result["inserted_beats"]])
 }
 ```
 
+- `anchors`：本次对齐实际采用的锚点（无锚点时为 `[]`），含两侧索引、
+  时间与偏差；每个锚点都一定出现在 `matched_beats` 中。
 - `matched_beats`：一一对应映射，含两侧索引、时间、偏差（秒）与状态。
 - `missed_beats` / `inserted_beats`：未配对的参考拍 / 演奏音。
 - `deviation_segments`：按**参考拍索引连续**切出的最大匹配段（漏拍 /
@@ -209,10 +253,28 @@ D(i,j) = min of  ⎨ D(i−1,j)   + skip_penalty          漏拍（水平）
   取对角匹配，保证结果确定。
 - 2000 拍、带宽 13 的典型输入在普通笔记本上约 0.3s、50MB 内存。
 
+### 锚点约束下的分段 DTW
+
+设锚点为 `(a₁,b₁), …, (aₖ,bₖ)`，在网格上加入虚拟边界起点 `(0,0)` 与
+终点 `(n,m)`，对每对相邻边界格点 `(i₀,j₀) → (i₁,j₁)` 分别求解一个
+Sakoe-Chiba 带子问题（带判定沿用**全局坐标** `|i−j| ≤ band_width`），
+段代价相加、回溯路径按序拼接：
+
+- 锚点 `(a,b)` 对应的格点是 `(a+1, b+1)`；该格点**禁止以水平（漏拍）或
+  垂直（插入拍）步到达**，只允许对角匹配步，确保锚点被真正一一匹配；
+- 每段仍是标准三转移 DTW（对角匹配 / 水平漏拍 / 垂直插入拍），段间互不
+  影响，漏拍 / 插入拍只能落在段内；
+- 因带判定基于全局索引，拼接后的完整路径与“在同一张全局 DP 表上把锚点
+  状态强制可达”等价：是一条位于原 Sakoe-Chiba 带内、经过全部锚点的
+  最优路径。
+- 校验在创建与执行对齐两处进行：索引严格递增、不越界、
+  `|ref_index − perf_index| ≤ band_width`（带宽不可达直接拒绝）。
+
 ## 状态码
 
 - `201` 任务创建成功；`200` 对齐 / 查询成功
-- `400` 带宽不足无法对齐（含 `|n−m| > band_width` 预检）或惩罚参数非法
+- `400` 带宽不足无法对齐（含 `|n−m| > band_width` 预检）、惩罚参数非法，
+  或锚点不满足严格递增 / 越界 / 带宽不可达（错误信息指明第几个锚点）
 - `404` 任务不存在
 - `409` 对尚未对齐（`pending`）的任务调用 `/result`
-- `422` 请求体校验失败（空序列、非递增等）
+- `422` 请求体校验失败（空序列、非递增、锚点索引为负数等类型错误）

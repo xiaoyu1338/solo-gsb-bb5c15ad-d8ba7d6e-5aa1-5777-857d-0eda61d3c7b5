@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 
 from . import crud
-from .alignment import AlignmentError, AlignmentParams, align_beats
+from .alignment import AlignmentError, AlignmentParams, align_beats, validate_anchors
 from .database import get_db, init_db
 from .schemas import JobCreate, JobOut, JobSummary
 
@@ -25,11 +25,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="多轨录音节拍对齐 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "提交参考节拍网格与演奏轨音符起始时间，服务使用带宽约束的动态时间规整"
         "（Sakoe-Chiba DTW）处理漏拍、抢拍与插入拍，回溯生成一一对应映射及"
-        "连续偏差区间。"
+        "连续偏差区间。创建任务时可选提供锚点（参考拍索引 / 演奏音索引），"
+        "锚点作为硬约束：DTW 被分段限制在相邻锚点之间求解，再合并为完整路径。"
     ),
     lifespan=lifespan,
 )
@@ -48,22 +49,29 @@ def health():
 @app.post("/jobs", response_model=JobOut, status_code=status.HTTP_201_CREATED, tags=["jobs"])
 def create_job(payload: JobCreate, db: sqlite3.Connection = Depends(get_db)):
     """创建对齐任务（创建后状态为 pending，需调用 /align 执行对齐）。"""
-    if abs(len(payload.reference_beats) - len(payload.performance_onsets)) > (
-        payload.params.band_width
-    ):
+    n, m = len(payload.reference_beats), len(payload.performance_onsets)
+    if abs(n - m) > payload.params.band_width:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
-                f"序列长度差 {abs(len(payload.reference_beats) - len(payload.performance_onsets))} "
-                f"超过带宽 {payload.params.band_width}，请增大 params.band_width"
+                f"序列长度差 {abs(n - m)} 超过带宽 {payload.params.band_width}，"
+                "请增大 params.band_width"
             ),
         )
+    anchors = [(a.ref_index, a.perf_index) for a in payload.anchors]
+    try:
+        validate_anchors(anchors, n, m, payload.params.band_width)
+    except AlignmentError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
     return crud.create_job(
         db,
         name=payload.name,
         reference_beats=payload.reference_beats,
         performance_onsets=payload.performance_onsets,
         params=payload.params.model_dump(),
+        anchors=[a.model_dump() for a in payload.anchors],
     )
 
 
@@ -86,8 +94,11 @@ def align_job(
         insert_penalty=job["params"].get("insert_penalty"),
         on_time_threshold=job["params"].get("on_time_threshold", 0.03),
     )
+    anchors = [(a["ref_index"], a["perf_index"]) for a in job.get("anchors", [])]
     try:
-        result = align_beats(job["reference_beats"], job["performance_onsets"], params)
+        result = align_beats(
+            job["reference_beats"], job["performance_onsets"], params, anchors
+        )
     except AlignmentError as exc:
         crud.save_error(db, job_id, str(exc))
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))

@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     reference_beats     TEXT    NOT NULL,   -- JSON 数组（秒）
     performance_onsets  TEXT    NOT NULL,   -- JSON 数组（秒）
     params              TEXT    NOT NULL,   -- JSON 参数
+    anchors             TEXT    NOT NULL DEFAULT '[]',  -- JSON 锚点硬约束
     status              TEXT    NOT NULL,   -- pending / done / error
     error               TEXT,
     result              TEXT,               -- JSON 对齐结果
@@ -23,6 +24,15 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_created_at ON jobs(created_at DESC);
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对早期建的库做就地升级（SQLite 无 CREATE COLUMN IF NOT EXISTS）。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    if "anchors" not in cols:
+        conn.execute(
+            "ALTER TABLE jobs ADD COLUMN anchors TEXT NOT NULL DEFAULT '[]'"
+        )
 
 
 def connect() -> sqlite3.Connection:
@@ -37,6 +47,8 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
+        conn.commit()
 
 
 def get_db() -> Generator[sqlite3.Connection, None, None]:
